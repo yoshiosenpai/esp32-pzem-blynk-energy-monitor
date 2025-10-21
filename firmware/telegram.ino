@@ -1,6 +1,7 @@
 /****************************************************
  * ESP32 + PZEM-004T v3.0 + Blynk (UNCHANGED)
- * + Telegram: /status, /on1, /off1, /on2, /off2, /on, /off
+ * + Telegram (patched): command normalization for groups
+ *   Commands: /status, /on1, /off1, /on2, /off2, /on, /off
  * + Night alerts per lamp (22:00–07:00 MYT) + "unknown load" alert
  ****************************************************/
 
@@ -90,7 +91,19 @@ bool inNightWindow(uint8_t hr) {
   return (hr >= NIGHT_START_H || hr < NIGHT_END_H);
 }
 
-// ---- Telegram helpers ----
+// ---------- Telegram helpers & PATCHES ----------
+String normalizeCmd(String s) {
+  s.trim();
+  // keep first token only
+  int sp = s.indexOf(' ');
+  if (sp > 0) s = s.substring(0, sp);
+  // strip @botname suffix if present
+  int at = s.indexOf('@');
+  if (at > 0) s = s.substring(0, at);
+  s.toLowerCase();
+  return s;
+}
+
 bool tgSend(const String &text) {
   WiFiClientSecure client; client.setInsecure();
   HTTPClient https;
@@ -105,10 +118,11 @@ bool tgSend(const String &text) {
 
 void setRelay(uint8_t pin, bool on) { digitalWrite(pin, on ? RELAY_ACTIVE : RELAY_IDLE); }
 
-void tgHandleCmd(const String &s) {
-  String cmd = s; cmd.trim();
+// Fully patched command handler (uses normalizeCmd)
+void tgHandleCmd(const String &raw) {
+  String cmd = normalizeCmd(raw);
 
-  if (cmd.equalsIgnoreCase("/status")) {
+  if (cmd == "/status" || cmd == "/start") {
     float p = pzem.power();
     bool l1 = relayIsOn(RELAY1);
     bool l2 = relayIsOn(RELAY2);
@@ -123,15 +137,15 @@ void tgHandleCmd(const String &s) {
     return;
   }
 
-  if (cmd.equalsIgnoreCase("/on1"))  { setRelay(RELAY1, true);  tgSend("Lamp 1 turned ON.");  return; }
-  if (cmd.equalsIgnoreCase("/off1")) { setRelay(RELAY1, false); tgSend("Lamp 1 turned OFF."); return; }
-  if (cmd.equalsIgnoreCase("/on2"))  { setRelay(RELAY2, true);  tgSend("Lamp 2 turned ON.");  return; }
-  if (cmd.equalsIgnoreCase("/off2")) { setRelay(RELAY2, false); tgSend("Lamp 2 turned OFF."); return; }
+  if (cmd == "/on1")  { setRelay(RELAY1, true);  tgSend("Lamp 1 turned ON.");  return; }
+  if (cmd == "/off1") { setRelay(RELAY1, false); tgSend("Lamp 1 turned OFF."); return; }
+  if (cmd == "/on2")  { setRelay(RELAY2, true);  tgSend("Lamp 2 turned ON.");  return; }
+  if (cmd == "/off2") { setRelay(RELAY2, false); tgSend("Lamp 2 turned OFF."); return; }
 
-  if (cmd.equalsIgnoreCase("/on"))   { setRelay(RELAY1, true);  setRelay(RELAY2, true);  tgSend("Both lamps ON.");  return; }
-  if (cmd.equalsIgnoreCase("/off"))  { setRelay(RELAY1, false); setRelay(RELAY2, false); tgSend("Both lamps OFF."); return; }
+  if (cmd == "/on")   { setRelay(RELAY1, true);  setRelay(RELAY2, true);  tgSend("Both lamps ON.");  return; }
+  if (cmd == "/off")  { setRelay(RELAY1, false); setRelay(RELAY2, false); tgSend("Both lamps OFF."); return; }
 
-  // ignore others to keep it simple
+  // Unknown command: ignore to keep it simple
 }
 
 void tgPoll() {
@@ -202,7 +216,7 @@ void pushReadings() {
   unsigned long now = millis();
   unsigned long targetMs = NIGHT_ON_MINUTES * 60UL * 1000UL;
 
-  // Per-lamp night alert by RELAY state (clean + simple)
+  // Per-lamp night alert by RELAY state
   for (int k = 0; k < 2; ++k) {
     bool isOn = relayIsOn(lamps[k].pin);
     if (night && isOn) {
