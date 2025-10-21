@@ -150,9 +150,10 @@ void tgPoll() {
   WiFiClientSecure client; client.setInsecure();
   HTTPClient https;
 
-  // Accept both message and edited_message to be safe
+  // accept message and edited_message
   String url = String("https://api.telegram.org/bot") + TELEGRAM_BOT_TOKEN +
-               "/getUpdates?timeout=10&allowed_updates=%5B%22message%22,%22edited_message%22%5D&offset=" + String(telegramUpdateOffset);
+               "/getUpdates?timeout=10&allowed_updates=%5B%22message%22,%22edited_message%22%5D&offset=" +
+               String(telegramUpdateOffset);
 
   if (!https.begin(client, url)) {
     Serial.println("[TG] begin() failed");
@@ -161,7 +162,7 @@ void tgPoll() {
 
   int code = https.GET();
   if (code < 200 || code >= 300) {
-    Serial.printf("[TG] HTTP %d\n", code);
+    Serial.printf("[TG] HTTP %d\n", code);   // e.g., -11 = read timeout (can ignore, will retry)
     https.end();
     return;
   }
@@ -169,14 +170,14 @@ void tgPoll() {
   String body = https.getString();
   https.end();
 
-  // --- DEBUG: peek at response (first 300 chars) ---
+  // DEBUG: peek at the first ~300 chars
   Serial.print("[TG] getUpdates OK. Body: ");
   Serial.println(body.substring(0, 300));
 
-  // Process all results
+  // Find results array
   int pos = body.indexOf("\"result\":[");
   if (pos < 0) return;
-  pos += 10; // after "result":[
+  pos += 10;
 
   while (true) {
     int uidIdx = body.indexOf("\"update_id\":", pos);
@@ -185,17 +186,17 @@ void tgPoll() {
     int uidEnd   = body.indexOf(',', uidStart);
     long uid     = body.substring(uidStart, uidEnd).toInt();
 
-    // We accept "message" OR "edited_message"
+    // pick message or edited_message block
     int msgIdx = body.indexOf("\"message\":{", uidEnd);
     int emgIdx = body.indexOf("\"edited_message\":{", uidEnd);
     int useIdx = -1;
-    String key = "";
+    String key;
 
     if (msgIdx >= 0 && (emgIdx < 0 || msgIdx < emgIdx)) { useIdx = msgIdx; key = "\"message\":"; }
     else if (emgIdx >= 0) { useIdx = emgIdx; key = "\"edited_message\":"; }
     if (useIdx < 0) { pos = uidEnd; telegramUpdateOffset = uid + 1; continue; }
 
-    // Find the enclosing brace for this message block (very light brace scan)
+    // extract full JSON object for the message
     int brace = body.indexOf('{', useIdx + key.length());
     if (brace < 0) { pos = uidEnd; telegramUpdateOffset = uid + 1; continue; }
     int depth = 1, i = brace + 1;
@@ -206,22 +207,52 @@ void tgPoll() {
     if (depth != 0) { pos = uidEnd; telegramUpdateOffset = uid + 1; continue; }
     String msgBlock = body.substring(brace, i);
 
-    // Extract chat id (order-independent)
-    // Look for: "chat":{"id":-100123...}
-    long chatId = 0;
+    // === STRING-BASED CHAT ID (no toInt) ===
+    String chatIdStr = "";
     int chatIdx = msgBlock.indexOf("\"chat\":");
     if (chatIdx >= 0) {
-      int idIdx = msgBlock.indexOf("\"id\":", chatIdx);
-      if (idIdx >= 0) {
-        int cs = msgBlock.indexOf(':', idIdx) + 1;
+      int idKey = msgBlock.indexOf("\"id\":", chatIdx);
+      if (idKey >= 0) {
+        int cs = msgBlock.indexOf(':', idKey) + 1;
         int ce = msgBlock.indexOf(',', cs);
         if (ce < 0) ce = msgBlock.indexOf('}', cs);
         if (cs > 0 && ce > cs) {
-          String idStr = msgBlock.substring(cs, ce); idStr.trim();
-          chatId = idStr.toInt(); // handles negatives too
+          chatIdStr = msgBlock.substring(cs, ce);
+          chatIdStr.trim();
         }
       }
     }
+
+    // text field
+    String text = "";
+    int textIdx = msgBlock.indexOf("\"text\":");
+    if (textIdx >= 0) {
+      int q1 = msgBlock.indexOf('\"', textIdx + 7);
+      int q2 = msgBlock.indexOf('\"', q1 + 1);
+      if (q1 > 0 && q2 > q1) text = msgBlock.substring(q1 + 1, q2);
+    }
+
+    // advance offset
+    telegramUpdateOffset = uid + 1;
+    pos = i;
+
+    // === Compare as strings ===
+    if (chatIdStr.length() == 0) continue;
+
+    // Handle either your group OR your private DM (optional):
+    // - Primary allow list: your configured TELEGRAM_CHAT_ID.
+    // - You can add a secondary allowed ID (owner DM) if you like.
+    if (chatIdStr != String(TELEGRAM_CHAT_ID)) {
+      Serial.print("[TG] Skipping chatId "); Serial.println(chatIdStr);
+      continue;
+    }
+
+    if (text.length() > 0) {
+      Serial.print("[TG] CMD: "); Serial.println(text);
+      tgHandleCmd(text);
+    }
+  }
+}
 
     // Extract text (order-independent)
     String text = "";
