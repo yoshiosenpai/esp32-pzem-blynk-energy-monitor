@@ -1,8 +1,10 @@
 /****************************************************
- * ESP32 + PZEM-004T v3.0 + Blynk (UNCHANGED)
- * + Telegram (patched): command normalization for groups
- *   Commands: /status, /on1, /off1, /on2, /off2, /on, /off
+ * ESP32 + PZEM-004T v3.0 + Blynk (UNCHANGED UX)
+ * + Telegram (group-ready): /status, /on1, /off1, /on2, /off2, /on, /off
  * + Night alerts per lamp (22:00–07:00 MYT) + "unknown load" alert
+ * Notes:
+ * - Set BotFather Group Privacy = OFF (recommended)
+ * - TELEGRAM_CHAT_ID must match your group's negative ID exactly
  ****************************************************/
 
 // ---- Blynk (unchanged) ----
@@ -91,12 +93,12 @@ bool inNightWindow(uint8_t hr) {
   return (hr >= NIGHT_START_H || hr < NIGHT_END_H);
 }
 
-// ---------- Telegram helpers & PATCHES ----------
+// ---------- Telegram helpers & normalization ----------
 String normalizeCmd(String s) {
   s.trim();
-  int sp = s.indexOf(' ');           // keep first token
+  int sp = s.indexOf(' ');            // keep first token
   if (sp > 0) s = s.substring(0, sp);
-  int at = s.indexOf('@');           // strip @botname
+  int at = s.indexOf('@');            // strip @botname suffix
   if (at > 0) s = s.substring(0, at);
   s.toLowerCase();
   return s;
@@ -107,16 +109,17 @@ bool tgSend(const String &text) {
   HTTPClient https;
   String url = String("https://api.telegram.org/bot") + TELEGRAM_BOT_TOKEN + "/sendMessage";
   String payload = String("{\"chat_id\":\"") + TELEGRAM_CHAT_ID + "\",\"text\":\"" + text + "\"}";
-  if (!https.begin(client, url)) return false;
+  if (!https.begin(client, url)) { Serial.println("[TG] begin() failed"); return false; }
   https.addHeader("Content-Type", "application/json");
   int code = https.POST(payload);
   https.end();
+  if (code < 200 || code >= 300) Serial.printf("[TG] send HTTP %d\n", code);
   return (code >= 200 && code < 300);
 }
 
 void setRelay(uint8_t pin, bool on) { digitalWrite(pin, on ? RELAY_ACTIVE : RELAY_IDLE); }
 
-// Fully patched command handler (uses normalizeCmd)
+// Commands: /status, /on1, /off1, /on2, /off2, /on, /off
 void tgHandleCmd(const String &raw) {
   String cmd = normalizeCmd(raw);
 
@@ -143,14 +146,13 @@ void tgHandleCmd(const String &raw) {
   if (cmd == "/on")   { setRelay(RELAY1, true);  setRelay(RELAY2, true);  tgSend("Both lamps ON.");  return; }
   if (cmd == "/off")  { setRelay(RELAY1, false); setRelay(RELAY2, false); tgSend("Both lamps OFF."); return; }
 
-  // Unknown command: ignore to keep it simple
+  // ignore others
 }
 
 void tgPoll() {
   WiFiClientSecure client; client.setInsecure();
   HTTPClient https;
 
-  // accept message and edited_message
   String url = String("https://api.telegram.org/bot") + TELEGRAM_BOT_TOKEN +
                "/getUpdates?timeout=10&allowed_updates=%5B%22message%22,%22edited_message%22%5D&offset=" +
                String(telegramUpdateOffset);
@@ -162,7 +164,7 @@ void tgPoll() {
 
   int code = https.GET();
   if (code < 200 || code >= 300) {
-    Serial.printf("[TG] HTTP %d\n", code);   // e.g., -11 = read timeout (can ignore, will retry)
+    Serial.printf("[TG] HTTP %d\n", code); // -11 = timeout sometimes, ignore
     https.end();
     return;
   }
@@ -170,11 +172,10 @@ void tgPoll() {
   String body = https.getString();
   https.end();
 
-  // DEBUG: peek at the first ~300 chars
+  // DEBUG (peek)
   Serial.print("[TG] getUpdates OK. Body: ");
   Serial.println(body.substring(0, 300));
 
-  // Find results array
   int pos = body.indexOf("\"result\":[");
   if (pos < 0) return;
   pos += 10;
@@ -186,11 +187,10 @@ void tgPoll() {
     int uidEnd   = body.indexOf(',', uidStart);
     long uid     = body.substring(uidStart, uidEnd).toInt();
 
-    // pick message or edited_message block
+    // prefer "message", else "edited_message"
     int msgIdx = body.indexOf("\"message\":{", uidEnd);
     int emgIdx = body.indexOf("\"edited_message\":{", uidEnd);
-    int useIdx = -1;
-    String key;
+    int useIdx = -1; String key;
 
     if (msgIdx >= 0 && (emgIdx < 0 || msgIdx < emgIdx)) { useIdx = msgIdx; key = "\"message\":"; }
     else if (emgIdx >= 0) { useIdx = emgIdx; key = "\"edited_message\":"; }
@@ -207,7 +207,7 @@ void tgPoll() {
     if (depth != 0) { pos = uidEnd; telegramUpdateOffset = uid + 1; continue; }
     String msgBlock = body.substring(brace, i);
 
-    // === STRING-BASED CHAT ID (no toInt) ===
+    // === STRING-BASED CHAT ID (avoid overflow) ===
     String chatIdStr = "";
     int chatIdx = msgBlock.indexOf("\"chat\":");
     if (chatIdx >= 0) {
@@ -217,8 +217,7 @@ void tgPoll() {
         int ce = msgBlock.indexOf(',', cs);
         if (ce < 0) ce = msgBlock.indexOf('}', cs);
         if (cs > 0 && ce > cs) {
-          chatIdStr = msgBlock.substring(cs, ce);
-          chatIdStr.trim();
+          chatIdStr = msgBlock.substring(cs, ce); chatIdStr.trim();
         }
       }
     }
@@ -232,49 +231,17 @@ void tgPoll() {
       if (q1 > 0 && q2 > q1) text = msgBlock.substring(q1 + 1, q2);
     }
 
-    // advance offset
+    // advance offset for next poll
     telegramUpdateOffset = uid + 1;
     pos = i;
 
-    // === Compare as strings ===
+    // must match target group
     if (chatIdStr.length() == 0) continue;
-
-    // Handle either your group OR your private DM (optional):
-    // - Primary allow list: your configured TELEGRAM_CHAT_ID.
-    // - You can add a secondary allowed ID (owner DM) if you like.
     if (chatIdStr != String(TELEGRAM_CHAT_ID)) {
       Serial.print("[TG] Skipping chatId "); Serial.println(chatIdStr);
       continue;
     }
 
-    if (text.length() > 0) {
-      Serial.print("[TG] CMD: "); Serial.println(text);
-      tgHandleCmd(text);
-    }
-  }
-}
-
-    // Extract text (order-independent)
-    String text = "";
-    int textIdx = msgBlock.indexOf("\"text\":");
-    if (textIdx >= 0) {
-      int q1 = msgBlock.indexOf('\"', textIdx + 7);
-      int q2 = msgBlock.indexOf('\"', q1 + 1);
-      if (q1 > 0 && q2 > q1) text = msgBlock.substring(q1 + 1, q2);
-    }
-
-    // Advance offset
-    telegramUpdateOffset = uid + 1;
-    pos = i;
-
-    // Guard: must match our target group
-    if (String(chatId) != String(TELEGRAM_CHAT_ID)) {
-      // Optional: print to see where messages are coming from
-      Serial.printf("[TG] Skipping chatId %ld\n", chatId);
-      continue;
-    }
-
-    // Got a text command for our group
     if (text.length() > 0) {
       Serial.print("[TG] CMD: "); Serial.println(text);
       tgHandleCmd(text);
