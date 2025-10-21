@@ -94,11 +94,9 @@ bool inNightWindow(uint8_t hr) {
 // ---------- Telegram helpers & PATCHES ----------
 String normalizeCmd(String s) {
   s.trim();
-  // keep first token only
-  int sp = s.indexOf(' ');
+  int sp = s.indexOf(' ');           // keep first token
   if (sp > 0) s = s.substring(0, sp);
-  // strip @botname suffix if present
-  int at = s.indexOf('@');
+  int at = s.indexOf('@');           // strip @botname
   if (at > 0) s = s.substring(0, at);
   s.toLowerCase();
   return s;
@@ -151,39 +149,106 @@ void tgHandleCmd(const String &raw) {
 void tgPoll() {
   WiFiClientSecure client; client.setInsecure();
   HTTPClient https;
+
+  // Accept both message and edited_message to be safe
   String url = String("https://api.telegram.org/bot") + TELEGRAM_BOT_TOKEN +
-               "/getUpdates?timeout=10&allowed_updates=%5B%22message%22%5D&offset=" + String(telegramUpdateOffset);
-  if (!https.begin(client, url)) return;
+               "/getUpdates?timeout=10&allowed_updates=%5B%22message%22,%22edited_message%22%5D&offset=" + String(telegramUpdateOffset);
+
+  if (!https.begin(client, url)) {
+    Serial.println("[TG] begin() failed");
+    return;
+  }
+
   int code = https.GET();
-  if (code >= 200 && code < 300) {
-    String body = https.getString();
-    int pos = 0;
-    while (true) {
-      int uidIdx = body.indexOf("\"update_id\":", pos);
-      if (uidIdx < 0) break;
-      int uidStart = body.indexOf(':', uidIdx) + 1;
-      int uidEnd   = body.indexOf(',', uidStart);
-      long uid     = body.substring(uidStart, uidEnd).toInt();
+  if (code < 200 || code >= 300) {
+    Serial.printf("[TG] HTTP %d\n", code);
+    https.end();
+    return;
+  }
 
-      int textKey  = body.indexOf("\"text\":", uidEnd);
-      if (textKey < 0) { pos = uidEnd; telegramUpdateOffset = uid + 1; continue; }
-      int q1 = body.indexOf('\"', textKey + 7);
-      int q2 = body.indexOf('\"', q1 + 1);
-      String text = body.substring(q1 + 1, q2);
+  String body = https.getString();
+  https.end();
 
-      int chatKey = body.indexOf("\"chat\":", textKey);
-      int idKey   = body.indexOf("\"id\":", chatKey);
-      int idStart = body.indexOf(':', idKey) + 1;
-      int idEnd   = body.indexOf(',', idStart);
-      String chatIdFound = body.substring(idStart, idEnd); chatIdFound.trim();
+  // --- DEBUG: peek at response (first 300 chars) ---
+  Serial.print("[TG] getUpdates OK. Body: ");
+  Serial.println(body.substring(0, 300));
 
-      if (chatIdFound == TELEGRAM_CHAT_ID) tgHandleCmd(text);
+  // Process all results
+  int pos = body.indexOf("\"result\":[");
+  if (pos < 0) return;
+  pos += 10; // after "result":[
 
-      pos = q2 + 1;
-      telegramUpdateOffset = uid + 1;
+  while (true) {
+    int uidIdx = body.indexOf("\"update_id\":", pos);
+    if (uidIdx < 0) break;
+    int uidStart = body.indexOf(':', uidIdx) + 1;
+    int uidEnd   = body.indexOf(',', uidStart);
+    long uid     = body.substring(uidStart, uidEnd).toInt();
+
+    // We accept "message" OR "edited_message"
+    int msgIdx = body.indexOf("\"message\":{", uidEnd);
+    int emgIdx = body.indexOf("\"edited_message\":{", uidEnd);
+    int useIdx = -1;
+    String key = "";
+
+    if (msgIdx >= 0 && (emgIdx < 0 || msgIdx < emgIdx)) { useIdx = msgIdx; key = "\"message\":"; }
+    else if (emgIdx >= 0) { useIdx = emgIdx; key = "\"edited_message\":"; }
+    if (useIdx < 0) { pos = uidEnd; telegramUpdateOffset = uid + 1; continue; }
+
+    // Find the enclosing brace for this message block (very light brace scan)
+    int brace = body.indexOf('{', useIdx + key.length());
+    if (brace < 0) { pos = uidEnd; telegramUpdateOffset = uid + 1; continue; }
+    int depth = 1, i = brace + 1;
+    for (; i < (int)body.length() && depth > 0; ++i) {
+      if (body[i] == '{') depth++;
+      else if (body[i] == '}') depth--;
+    }
+    if (depth != 0) { pos = uidEnd; telegramUpdateOffset = uid + 1; continue; }
+    String msgBlock = body.substring(brace, i);
+
+    // Extract chat id (order-independent)
+    // Look for: "chat":{"id":-100123...}
+    long chatId = 0;
+    int chatIdx = msgBlock.indexOf("\"chat\":");
+    if (chatIdx >= 0) {
+      int idIdx = msgBlock.indexOf("\"id\":", chatIdx);
+      if (idIdx >= 0) {
+        int cs = msgBlock.indexOf(':', idIdx) + 1;
+        int ce = msgBlock.indexOf(',', cs);
+        if (ce < 0) ce = msgBlock.indexOf('}', cs);
+        if (cs > 0 && ce > cs) {
+          String idStr = msgBlock.substring(cs, ce); idStr.trim();
+          chatId = idStr.toInt(); // handles negatives too
+        }
+      }
+    }
+
+    // Extract text (order-independent)
+    String text = "";
+    int textIdx = msgBlock.indexOf("\"text\":");
+    if (textIdx >= 0) {
+      int q1 = msgBlock.indexOf('\"', textIdx + 7);
+      int q2 = msgBlock.indexOf('\"', q1 + 1);
+      if (q1 > 0 && q2 > q1) text = msgBlock.substring(q1 + 1, q2);
+    }
+
+    // Advance offset
+    telegramUpdateOffset = uid + 1;
+    pos = i;
+
+    // Guard: must match our target group
+    if (String(chatId) != String(TELEGRAM_CHAT_ID)) {
+      // Optional: print to see where messages are coming from
+      Serial.printf("[TG] Skipping chatId %ld\n", chatId);
+      continue;
+    }
+
+    // Got a text command for our group
+    if (text.length() > 0) {
+      Serial.print("[TG] CMD: "); Serial.println(text);
+      tgHandleCmd(text);
     }
   }
-  https.end();
 }
 
 // ---- Core: readings + night alerts (Blynk unchanged) ----
