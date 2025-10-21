@@ -1,13 +1,10 @@
 /****************************************************
- * ESP32 + PZEM-004T v3.0 + Blynk + 2-Relay (UNCHANGED UX)
- * + Telegram: team control (commands + reply keyboard)
- * + Night-only alert window (default 22:00–07:00, MYT)
- *
- * Blynk widgets/logic remain EXACTLY as before.
- * Telegram is additive: alerts + chat commands.
+ * ESP32 + PZEM-004T v3.0 + Blynk (unchanged)
+ * + Telegram: /status, /off, /on
+ * + Night mode alert (22:00–07:00 MYT): notify if lamp stays ON
  ****************************************************/
 
-
+// -------- Blynk Template / Auth (UNCHANGED) --------
 #define BLYNK_TEMPLATE_ID   "BLYNK TEMPLATE ID"
 #define BLYNK_TEMPLATE_NAME "BLYNK TEMPLATE NAME"
 #define BLYNK_AUTH_TOKEN    "BLYNK TOKEN"
@@ -18,15 +15,16 @@
 #include <HTTPClient.h>
 #include <BlynkSimpleEsp32.h>
 #include <PZEM004Tv30.h>
-#include <time.h>  
+#include <time.h>  // NTP time
 
 // -------- Wi-Fi --------
 char ssid[] = "WIFI NAME";
 char pass[] = "WIFI PASSWORD";
 
-// -------- Telegram --------
+// -------- Telegram (minimal) --------
+// Group IDs are negative (e.g. "-1001234567890"); 1-1 chat is positive.
 #define TELEGRAM_BOT_TOKEN "XXXXXXXX:YYYYYYYYYYYYYYYYYYYYYYYYYYYYYYY"
-#define TELEGRAM_CHAT_ID   "6535703218"
+#define TELEGRAM_CHAT_ID   "-1001234567890"
 
 // -------- Pins (UNCHANGED) --------
 #define RX_PIN   16   // ESP32 RX2  <- PZEM TX
@@ -46,68 +44,44 @@ BlynkTimer timer;
 BLYNK_WRITE(V10) { digitalWrite(RELAY1, param.asInt() ? RELAY_ACTIVE : RELAY_IDLE); }
 BLYNK_WRITE(V11) { digitalWrite(RELAY2, param.asInt() ? RELAY_ACTIVE : RELAY_IDLE); }
 
-// -------- Left-on detection settings --------
-float ON_W_THRESHOLD = 5.0;                 // W → treat ≥ this as “ON”
-unsigned long LEFT_ON_MINUTES = 10;         // minutes continuously ON before alert
-const unsigned long NOTIF_COOLDOWN_MS = 10UL * 60UL * 1000UL; // 10 min anti-spam
+// -------- Simple settings --------
+float ON_W_THRESHOLD        = 5.0;    // W: treat >= as "lamp ON" (tune to your lamp)
+unsigned long NIGHT_ON_MINUTES = 5;   // continuous minutes before alert at night
+const unsigned long NOTIF_COOLDOWN_MS = 30UL * 60UL * 1000UL; // alert at most every 30 min
 
-// Night-only window (MYT, via NTP)
-bool nightOnlyEnabled = true;
-uint8_t nightStartHour = 22;  // 22:00
-uint8_t nightEndHour   = 7;   // 07:00
+// Night window: 22:00 → 07:00 (MYT)
+const uint8_t NIGHT_START_H = 22;
+const uint8_t NIGHT_END_H   = 7;
 
-// State
+// -------- State --------
 unsigned long onSinceMs = 0;
 unsigned long lastNotifMs = 0;
-unsigned long snoozeUntilMs = 0;
 
-// Telegram getUpdates offset
+// Telegram polling
 long telegramUpdateOffset = 0;
 
 // -------- Time (NTP) --------
-const long GMT_OFFSET_SEC = 8 * 3600; // MYT = UTC+8
+const long GMT_OFFSET_SEC = 8 * 3600; // Asia/Kuala_Lumpur
 const int  DST_OFFSET_SEC = 0;
 
 bool getLocalHour(uint8_t &hourOut) {
-  struct tm timeinfo;
-  if (!getLocalTime(&timeinfo, 1000)) return false;
-  hourOut = (uint8_t)timeinfo.tm_hour;
+  struct tm t;
+  if (!getLocalTime(&t, 1000)) return false;
+  hourOut = (uint8_t)t.tm_hour;
   return true;
 }
-
 bool inNightWindow(uint8_t hr) {
-  if (!nightOnlyEnabled) return false;          // if disabled → not restricting
-  if (nightStartHour == nightEndHour) return false; // treated as disabled
-  if (nightStartHour < nightEndHour) {          // e.g., 20 → 23 (no wrap)
-    return (hr >= nightStartHour && hr < nightEndHour);
-  } else {                                      // e.g., 22 → 7 (wrap)
-    return (hr >= nightStartHour || hr < nightEndHour);
-  }
+  // 22→07 wraps midnight: (hr>=22 || hr<7)
+  if (NIGHT_START_H < NIGHT_END_H) return (hr >= NIGHT_START_H && hr < NIGHT_END_H);
+  return (hr >= NIGHT_START_H || hr < NIGHT_END_H);
 }
 
-// -------- Telegram helpers --------
-bool sendTelegram(const String &text, bool withKeyboard = false) {
+// -------- Telegram helpers (minimal) --------
+bool tgSend(const String &text) {
   WiFiClientSecure client; client.setInsecure();
   HTTPClient https;
-
   String url = String("https://api.telegram.org/bot") + TELEGRAM_BOT_TOKEN + "/sendMessage";
-  String payload;
-  if (withKeyboard) {
-    // Reply keyboard with basic controls
-    payload =
-      String("{\"chat_id\":\"") + TELEGRAM_CHAT_ID + "\","
-      "\"text\":\"" + text + "\","
-      "\"reply_markup\":{\"keyboard\":["
-        "[\"/status\",\"/off\",\"/on\"],"
-        "[\"/snooze 30\",\"/help\"]"
-      "],\"resize_keyboard\":true}"
-      "}";
-  } else {
-    payload =
-      String("{\"chat_id\":\"") + TELEGRAM_CHAT_ID + "\","
-      "\"text\":\"" + text + "\"}";
-  }
-
+  String payload = String("{\"chat_id\":\"") + TELEGRAM_CHAT_ID + "\",\"text\":\"" + text + "\"}";
   if (!https.begin(client, url)) return false;
   https.addHeader("Content-Type", "application/json");
   int code = https.POST(payload);
@@ -117,124 +91,27 @@ bool sendTelegram(const String &text, bool withKeyboard = false) {
 
 void setRelay1(bool on) {
   digitalWrite(RELAY1, on ? RELAY_ACTIVE : RELAY_IDLE);
-  // Blynk UI is left untouched; we’re not forcing the app widget here.
+  // Blynk UI left as-is (no forced sync), so your app remains unchanged.
 }
 
-// Parse a tiny slice of JSON (no full lib) from getUpdates
-void handleTelegramCommand(const String &cmdline) {
-  String s = cmdline; s.trim();
-
-  if (s.equalsIgnoreCase("/help")) {
-    sendTelegram(
-      "Commands:\n"
-      "/status\n"
-      "/off  (turn lamp off)\n"
-      "/on   (turn lamp on)\n"
-      "/snooze <min>\n"
-      "/settimeout <min>\n"
-      "/setthreshold <watts>\n"
-      "/night on|off\n"
-      "/nightwindow <startHr> <endHr>\n"
-      "/buttons\n"
-      "/help"
-    , true);
-    return;
-  }
-
-  if (s.equalsIgnoreCase("/buttons")) {
-    sendTelegram("Buttons shown. Use them for quick control.", true);
-    return;
-  }
-
-  if (s.equalsIgnoreCase("/status")) {
+void tgHandleCmd(const String &s) {
+  String cmd = s; cmd.trim();
+  if (cmd.equalsIgnoreCase("/status")) {
     float p = pzem.power();
-    bool lampOn = (digitalRead(RELAY1) == RELAY_ACTIVE);
-    uint8_t hr = 0; bool gotHr = getLocalHour(hr);
-    String t = String("Lamp: ") + (lampOn ? "ON" : "OFF") +
-               "\nPower: " + String(p,1) + " W" +
-               "\nThreshold: " + String(ON_W_THRESHOLD,1) + " W" +
-               "\nTimeout: " + LEFT_ON_MINUTES + " min" +
-               "\nNight-only: " + String(nightOnlyEnabled ? "ON" : "OFF") +
-               "\nWindow: " + nightStartHour + "→" + nightEndHour +
-               (gotHr ? ("\nLocal hour: " + String(hr)) : "\nLocal hour: (pending NTP)") +
-               (snoozeUntilMs > millis() ? ("\nSnoozed (min left): " + String((snoozeUntilMs - millis())/60000UL)) : "");
-    sendTelegram(t);
+    bool lamp = (digitalRead(RELAY1) == RELAY_ACTIVE);
+    uint8_t hr=0; bool ok=getLocalHour(hr);
+    tgSend(String("Lamp: ") + (lamp?"ON":"OFF") +
+           "\nPower: " + String(p,1) + " W" +
+           "\nNight window: 22:00–07:00" +
+           (ok ? ("\nLocal hour: " + String(hr)) : "\nLocal hour: (Syncing NTP)") );
     return;
   }
-
-  if (s.equalsIgnoreCase("/off")) { setRelay1(false); sendTelegram("Lamp turned OFF."); return; }
-  if (s.equalsIgnoreCase("/on"))  { setRelay1(true);  sendTelegram("Lamp turned ON.");  return; }
-
-  if (s.startsWith("/snooze")) {
-    int sp = s.indexOf(' ');
-    if (sp > 0) {
-      long m = s.substring(sp+1).toInt();
-      if (m >= 1 && m <= 720) {
-        snoozeUntilMs = millis() + (unsigned long)m * 60000UL;
-        sendTelegram(String("Snoozed alerts for ") + m + " minutes.");
-        return;
-      }
-    }
-    sendTelegram("Usage: /snooze <minutes> (1..720)");
-    return;
-  }
-
-  if (s.startsWith("/settimeout")) {
-    int sp = s.indexOf(' ');
-    if (sp > 0) {
-      long m = s.substring(sp+1).toInt();
-      if (m >= 1 && m <= 240) {
-        LEFT_ON_MINUTES = (unsigned long)m;
-        sendTelegram(String("Timeout updated: ") + LEFT_ON_MINUTES + " min.");
-        return;
-      }
-    }
-    sendTelegram("Usage: /settimeout <minutes> (1..240)");
-    return;
-  }
-
-  if (s.startsWith("/setthreshold")) {
-    int sp = s.indexOf(' ');
-    if (sp > 0) {
-      float w = s.substring(sp+1).toFloat();
-      if (w >= 0.5 && w <= 2000.0) {
-        ON_W_THRESHOLD = w;
-        sendTelegram(String("Threshold updated: ") + String(ON_W_THRESHOLD,1) + " W.");
-        return;
-      }
-    }
-    sendTelegram("Usage: /setthreshold <watts> (0.5..2000)");
-    return;
-  }
-
-  if (s.equalsIgnoreCase("/night on") || s.equalsIgnoreCase("/night off")) {
-    nightOnlyEnabled = s.endsWith("on");
-    sendTelegram(String("Night-only alert window: ") + (nightOnlyEnabled ? "ON" : "OFF"));
-    return;
-  }
-
-  if (s.startsWith("/nightwindow")) {
-    // /nightwindow 22 7
-    int sp1 = s.indexOf(' ');
-    int sp2 = s.indexOf(' ', sp1 + 1);
-    if (sp1 > 0 && sp2 > sp1) {
-      int sH = s.substring(sp1+1, sp2).toInt();
-      int eH = s.substring(sp2+1).toInt();
-      if (sH >= 0 && sH <= 23 && eH >= 0 && eH <= 23) {
-        nightStartHour = (uint8_t)sH;
-        nightEndHour   = (uint8_t)eH;
-        sendTelegram(String("Night window set: ") + nightStartHour + "→" + nightEndHour);
-        return;
-      }
-    }
-    sendTelegram("Usage: /nightwindow <startHour 0..23> <endHour 0..23>");
-    return;
-  }
-
-  sendTelegram("Unknown. Try /help", true);
+  if (cmd.equalsIgnoreCase("/off")) { setRelay1(false); tgSend("Lamp turned OFF."); return; }
+  if (cmd.equalsIgnoreCase("/on"))  { setRelay1(true);  tgSend("Lamp turned ON.");  return; }
+  // Ignore others
 }
 
-void pollTelegram() {
+void tgPoll() {
   WiFiClientSecure client; client.setInsecure();
   HTTPClient https;
   String url = String("https://api.telegram.org/bot") + TELEGRAM_BOT_TOKEN +
@@ -264,9 +141,7 @@ void pollTelegram() {
       int idEnd   = body.indexOf(',', idStart);
       String chatIdFound = body.substring(idStart, idEnd); chatIdFound.trim();
 
-      if (chatIdFound == TELEGRAM_CHAT_ID) {
-        handleTelegramCommand(text);
-      }
+      if (chatIdFound == TELEGRAM_CHAT_ID) tgHandleCmd(text);
 
       pos = q2 + 1;
       telegramUpdateOffset = uid + 1;
@@ -275,6 +150,7 @@ void pollTelegram() {
   https.end();
 }
 
+// -------- Core reading + night alert (Blynk unchanged) --------
 void pushReadings() {
   static bool first = true;
 
@@ -285,55 +161,41 @@ void pushReadings() {
 
   if (first) { first = false; return; }
   if (isnan(v) || isnan(i) || isnan(p) || isnan(e)) {
-    Serial.println("PZEM read error (check AC L/N, CT S1/S2, TX/RX).");
+    Serial.println("PZEM read error (check wiring).");
     return;
   }
 
   Serial.printf("V=%.1f V | I=%.3f A | P=%.1f W | E=%.3f kWh\n", v, i, p, e);
 
-  // Push to Blynk (same virtuals)
+  // Push to Blynk (same virtual pins)
   Blynk.virtualWrite(V0, v);
   Blynk.virtualWrite(V1, i);
   Blynk.virtualWrite(V2, p);
   Blynk.virtualWrite(V3, e);
 
-  // --- "Left-on" detection with optional night-only window ---
-  unsigned long now = millis();
-  bool lampAppearsOn = (p >= ON_W_THRESHOLD);
-
-  // Resolve current local hour for night window
+  // Night-mode alert
   uint8_t hr = 0; bool haveHr = getLocalHour(hr);
-  bool shouldCheck = true;
-  if (nightOnlyEnabled) {
-    if (haveHr) shouldCheck = inNightWindow(hr);
-    else        shouldCheck = true; // if time not synced yet, don't block alerts
-  }
+  bool night = haveHr ? inNightWindow(hr) : true; // if time not yet synced, allow alerts
 
-  bool snoozed = (snoozeUntilMs > now);
+  unsigned long now = millis();
+  bool lampOnByPower = (p >= ON_W_THRESHOLD);
 
-  if (lampAppearsOn && shouldCheck && !snoozed) {
-    if (onSinceMs == 0) { onSinceMs = now; }
-    else {
-      unsigned long elapsed = now - onSinceMs;
-      unsigned long target  = LEFT_ON_MINUTES * 60UL * 1000UL;
-      if (elapsed >= target) {
-        bool cooldownOk = (now - lastNotifMs) >= NOTIF_COOLDOWN_MS;
-        if (cooldownOk) {
-          String msg = String("⚠️ Lamp likely LEFT ON for ")
-                     + LEFT_ON_MINUTES + " min. Power ~" + String(p,1) + " W."
-                     + (nightOnlyEnabled ? " (Night window)" : "");
-          if (sendTelegram(msg, true)) {
-            lastNotifMs = now;
-            Serial.println("Telegram sent: Left-on alert.");
-          } else {
-            Serial.println("Telegram send failed.");
-          }
-        }
+  if (night && lampOnByPower) {
+    if (onSinceMs == 0) onSinceMs = now;
+    unsigned long elapsed = now - onSinceMs;
+    unsigned long target  = NIGHT_ON_MINUTES * 60UL * 1000UL;
+
+    if (elapsed >= target) {
+      bool cooldownOk = (now - lastNotifMs) >= NOTIF_COOLDOWN_MS;
+      if (cooldownOk) {
+        tgSend(String("⚠️ Night alert: lamp has been ON for ")
+               + NIGHT_ON_MINUTES + " min (≈" + String(p,1) + " W). "
+               "If unintended, please turn it OFF.");
+        lastNotifMs = now;
       }
     }
   } else {
-    // Reset if power fell below threshold OR outside window OR snoozed
-    onSinceMs = 0;
+    onSinceMs = 0; // reset if not in night window or lamp off
   }
 }
 
@@ -345,18 +207,17 @@ void setup() {
   digitalWrite(RELAY1, RELAY_IDLE);
   digitalWrite(RELAY2, RELAY_IDLE);
 
-  // WiFi via Blynk (UNCHANGED for your UX)
+  // Blynk handles Wi-Fi too (UX unchanged)
   Blynk.begin(BLYNK_AUTH_TOKEN, ssid, pass);
 
-  // NTP time (MYT)
+  // NTP time (Asia/Kuala_Lumpur)
   configTime(GMT_OFFSET_SEC, DST_OFFSET_SEC, "pool.ntp.org", "time.nist.gov");
 
   // Timers
-  timer.setInterval(2000, pushReadings);  // PZEM + “left-on” monitor
-  timer.setInterval(3000, pollTelegram);  // Telegram command polling
+  timer.setInterval(2000, pushReadings); // PZEM + night alert
+  timer.setInterval(3000, tgPoll);       // Telegram command polling
 
-  // Optional: show buttons once on boot
-  sendTelegram("ESP32 is online. Use buttons or /help.", true);
+  tgSend("ESP32 online. Commands: /status, /off, /on");
 }
 
 void loop() {
